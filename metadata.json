@@ -1,0 +1,10 @@
+{
+  "name": "Ciudad-Trueque",
+  "description": "Un juego de rol cooperativo y simulación vecinal sobre el comercio libre de dinero, la asamblea popular autogestionada, la gestión de recursos y la toma de decisiones ecológicas colectivas.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
