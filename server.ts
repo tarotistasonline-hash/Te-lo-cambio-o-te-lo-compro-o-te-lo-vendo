@@ -186,6 +186,17 @@ app.get("/api/visits", (req, res) => {
   res.json({ totalVisits: data.visits.total });
 });
 
+app.post("/api/visits/sync", (req, res) => {
+  const { totalVisits } = req.body;
+  if (typeof totalVisits === "number" && totalVisits >= 0) {
+    const data = readData();
+    data.visits.total = Math.max(data.visits.total, totalVisits);
+    writeData(data);
+    return res.json({ totalVisits: data.visits.total, status: "synced" });
+  }
+  res.status(400).json({ error: "Invalid totalVisits" });
+});
+
 app.post("/api/visits/increment", (req, res) => {
   const { sessionId, isOwner } = req.body;
   const data = readData();

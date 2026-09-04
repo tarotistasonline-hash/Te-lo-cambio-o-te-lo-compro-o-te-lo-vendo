@@ -37,6 +37,7 @@ interface Publication {
   imageUrl: string;
   timestamp: number;
   views: number;
+  userId?: string;
   status?: "active" | "closed";
   price?: number;
 }
@@ -540,16 +541,20 @@ export default function App() {
     }
     setUserName(uName);
 
-    // AUTO-EXCLUDE DEVELOPER HOSTNAMES
+    // AUTO-EXCLUDE DEVELOPER & PREVIEW HOSTNAMES
     const isDevHost = window.location.hostname.includes("localhost") || 
                       window.location.hostname.includes("ais-dev-") ||
+                      window.location.hostname.includes("ais-pre-") ||
                       window.location.hostname.includes("127.0.0.1") ||
-                      window.location.hostname.includes("ai.studio");
+                      window.location.hostname.includes("ai.studio") ||
+                      window.location.hostname.includes("run.app");
                        
     let isExcluded = localStorage.getItem("exclude_visit") === "true";
-    if (isDevHost && localStorage.getItem("exclude_visit") === null) {
-      localStorage.setItem("exclude_visit", "true");
-      isExcluded = true;
+    if (localStorage.getItem("exclude_visit") === null) {
+      if (isDevHost) {
+        localStorage.setItem("exclude_visit", "true");
+        isExcluded = true;
+      }
     }
     setExcludeSelf(isExcluded);
 
@@ -632,7 +637,7 @@ export default function App() {
     const isExcluded = localStorage.getItem("exclude_visit") === "true";
 
     if (isExcluded) {
-      console.log("Excluding visit increment for the developer/admin.");
+      console.log("[Visitas] Visita excluida: Usuario marcado como desarrollador/propietario.");
       sessionStorage.setItem("has_registered_visit", "true");
       if (!hasRegisteredVisit) {
         trackEvent("App Visit Admin", { email: "" });
@@ -642,33 +647,45 @@ export default function App() {
         sessionStorage.setItem("has_registered_visit", "true");
         trackEvent("App Visit");
         
+        // Increment atomic count in Firestore
         const visitsDocRef = doc(db, "stats", "global");
-        getDoc(visitsDocRef)
-          .then((snap) => {
-            if (snap.exists()) {
-              const currentVisits = snap.data().visits || 0;
-              setDoc(visitsDocRef, { visits: currentVisits + 1 }, { merge: true });
-            } else {
-              setDoc(visitsDocRef, { visits: 3128 }, { merge: true });
-            }
-          })
+        setDoc(visitsDocRef, { visits: increment(1) }, { merge: true })
           .catch((err) => {
-            console.error("Error updating global visits:", err);
+            console.error("Error updating global visits in Firestore:", err);
           });
+
+        // Also notify backend API
+        const sessId = localStorage.getItem("trueque_sessionId") || ("sess_" + Math.random().toString(36).substring(2, 12));
+        fetch("/api/visits/increment", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: sessId, isOwner: false })
+        }).catch(err => console.warn("Backend visit update error:", err));
       }
     }
 
     // Subscribe to total visits count in real-time
     const visitsDocRef = doc(db, "stats", "global");
     const unsubscribeVisits = onSnapshot(visitsDocRef, (snap) => {
-      if (snap.exists()) {
-        setTotalVisits(snap.data().visits || 3128);
-      } else {
-        setTotalVisits(3128);
+      if (snap.exists() && typeof snap.data().visits === "number") {
+        setTotalVisits(snap.data().visits);
+        // Sync with backend API
+        fetch("/api/visits/sync", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ totalVisits: snap.data().visits })
+        }).catch(() => {});
       }
     }, (err) => {
-      console.warn("Could not listen to real-time stats, using local fallback counter:", err);
-      setTotalVisits(3128);
+      console.warn("Could not listen to real-time stats, using API fallback:", err);
+      fetch("/api/visits")
+        .then(r => r.json())
+        .then(d => {
+          if (typeof d.totalVisits === "number") {
+            setTotalVisits(d.totalVisits);
+          }
+        })
+        .catch(e => console.error("Error fetching fallback visits:", e));
     });
 
     // Subscribe to publications in real-time
@@ -702,6 +719,7 @@ export default function App() {
           imageUrl: data.imageUrl || "https://images.unsplash.com/photo-1544816155-12df9643f363?w=600&auto=format&fit=crop",
           timestamp: typeof data.createdAt === "number" ? data.createdAt : (data.timestamp || Date.now()),
           views: data.views || 0,
+          userId: data.userId || "",
           status: data.status || "active",
           price: data.price !== undefined ? Number(data.price) : undefined
         };
@@ -1112,16 +1130,52 @@ export default function App() {
     setSelectedPub(pub);
     trackEvent("View Publication Details", { id: pub.id, title: pub.title, type: pub.type });
 
-    // Increment view counter in Firestore
+    // 1. Check if user has visit exclusion enabled
     const isExcluded = localStorage.getItem("exclude_visit") === "true";
-    if (!isExcluded) {
-      const productRef = doc(db, "products", pub.id);
-      updateDoc(productRef, { views: increment(1) })
-        .then(() => {
-          setSelectedPub(curr => curr && curr.id === pub.id ? { ...curr, views: (curr.views || 0) + 1 } : curr);
-        })
-        .catch(err => console.error("Error updating views in Firestore:", err));
+
+    // 2. Check if this publication belongs to the current user (author)
+    let isMyPublication = false;
+    try {
+      const myPubs: string[] = JSON.parse(localStorage.getItem("my_publications_ids") || "[]");
+      const currentUid = userId || localStorage.getItem("trueque_userId") || "";
+      const currentName = (userName || localStorage.getItem("trueque_userName") || "").trim().toLowerCase();
+
+      isMyPublication = myPubs.includes(pub.id) ||
+        Boolean(pub.userId && pub.userId === currentUid) ||
+        Boolean(pub.contactName && currentName && pub.contactName.trim().toLowerCase() === currentName);
+    } catch (e) {
+      console.warn("Error checking publication ownership:", e);
     }
+
+    if (isExcluded || isMyPublication) {
+      console.log(`[Visitas] Visita propia excluida para "${pub.title}": ${isExcluded ? "Filtro activo" : "Publicación propia"}`);
+      return;
+    }
+
+    // 3. Deduplicate per session (don't increment multiple times on same session)
+    const sessionKey = `viewed_pub_${pub.id}`;
+    const alreadyViewed = sessionStorage.getItem(sessionKey) === "true";
+    if (alreadyViewed) {
+      return;
+    }
+
+    sessionStorage.setItem(sessionKey, "true");
+
+    // Increment in Firestore
+    const productRef = doc(db, "products", pub.id);
+    updateDoc(productRef, { views: increment(1) })
+      .then(() => {
+        setSelectedPub(curr => curr && curr.id === pub.id ? { ...curr, views: (curr.views || 0) + 1 } : curr);
+        setPublications(prev => prev.map(p => p.id === pub.id ? { ...p, views: (p.views || 0) + 1 } : p));
+      })
+      .catch(err => console.error("Error updating views in Firestore:", err));
+
+    // Also notify backend API
+    fetch(`/api/publications/${pub.id}/view`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ isOwner: false })
+    }).catch(err => console.warn("Backend view update error:", err));
   };
 
   // Open Create Modal Helper
@@ -1609,6 +1663,7 @@ export default function App() {
       imageUrl: newPubImageUrl,
       createdAt: Date.now(),
       views: 0,
+      userId: userId || localStorage.getItem("trueque_userId") || "",
       status: "active",
       price: newPubPrice ? Number(newPubPrice) : null
     };
@@ -1834,6 +1889,12 @@ export default function App() {
     } catch (e) {}
 
     trackEvent("Admin - Toggle Exclude visits", { excluded: val });
+    showToast(
+      val 
+        ? "🛡️ Tus visitas ahora están excluidas del contador general y de publicaciones." 
+        : "🟢 Tus visitas serán contabilizadas como visitante común.",
+      val ? "info" : "success"
+    );
   };
 
   // Save customized user info
@@ -1996,6 +2057,29 @@ export default function App() {
         </div>
 
         <div className="flex items-center space-x-2">
+          {/* REAL VISIT COUNTER BADGE IN HEADER */}
+          <button 
+            type="button"
+            onClick={() => handleToggleExcludeSelf(!excludeSelf)}
+            className="hidden sm:flex items-center space-x-1.5 px-3 py-1.5 rounded-xl border border-slate-200/80 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-800/80 hover:bg-slate-100 dark:hover:bg-slate-700/80 transition-all cursor-pointer shadow-xs select-none group"
+            title={excludeSelf ? "Contador de visitas reales activo. Tus visitas están excluidas (Clic para cambiar)." : "Contador de visitas activo. Tus visitas se están registrando (Clic para excluirte)."}
+            id="header-visit-counter-btn"
+          >
+            <span className="relative flex h-2 w-2">
+              <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${excludeSelf ? "bg-amber-400" : "bg-emerald-400"}`}></span>
+              <span className={`relative inline-flex rounded-full h-2 w-2 ${excludeSelf ? "bg-amber-500" : "bg-emerald-500"}`}></span>
+            </span>
+            <Eye className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400 group-hover:scale-110 transition-transform" />
+            <div className="flex flex-col text-left leading-none">
+              <span className="text-[11px] font-black text-slate-800 dark:text-slate-100 font-mono tracking-tight">
+                {totalVisits.toLocaleString()} <span className="text-[9px] font-bold text-slate-500 font-sans">visitas</span>
+              </span>
+              <span className={`text-[8px] font-extrabold uppercase tracking-wider ${excludeSelf ? "text-amber-600 dark:text-amber-400" : "text-emerald-600 dark:text-emerald-400"}`}>
+                {excludeSelf ? "🛡️ Excluyendo las mías" : "🟢 Visitas reales"}
+              </span>
+            </div>
+          </button>
+
           <button 
             onClick={() => { setActiveTab("chat"); trackEvent("Header Clicked Tab", { tab: "chat" }); }}
             className={`p-2 sm:p-2.5 rounded-xl border transition-all relative ${
@@ -2132,10 +2216,10 @@ export default function App() {
                 <div className="space-y-2">
                   <div className="flex items-center space-x-2 text-orange-400">
                     <ShieldAlert className="w-4 h-4" />
-                    <h4 className="font-bold text-sm">Filtro de Creador (Exclusión)</h4>
+                    <h4 className="font-bold text-sm">Filtro de Creador (Excluir Mis Visitas)</h4>
                   </div>
                   <p className="text-[11px] text-indigo-200 leading-relaxed">
-                    Excluye tus propias visitas y clicks para que el contador real de la app y los logs de Mixpanel no se inflen con tus pruebas de diseño.
+                    Excluye tus propias visitas y clics para que el contador real de la app ({totalVisits.toLocaleString()} visitas) y las visualizaciones de tus publicaciones no se inflen con tus pruebas.
                   </p>
                 </div>
 
@@ -2143,7 +2227,7 @@ export default function App() {
                   <div className="space-y-0.5">
                     <span className="text-xs font-bold text-slate-100 block">Excluir mis visitas</span>
                     <span className="text-[9px] text-indigo-300 block">
-                      {excludeSelf ? "🔒 Actualmente excluido" : "🟢 Actualmente registrado"}
+                      {excludeSelf ? "🔒 Tus visitas están excluidas" : "🟢 Tus visitas se están registrando"}
                     </span>
                   </div>
                   <button 
@@ -3362,6 +3446,11 @@ export default function App() {
                     <span className="text-[10px] text-slate-500 font-bold flex items-center gap-1">
                       <Eye className="w-3.5 h-3.5" /> {selectedPub.views || 0} visitas
                     </span>
+                    {(excludeSelf || (selectedPub.userId && selectedPub.userId === userId) || (userName && selectedPub.contactName && selectedPub.contactName.trim().toLowerCase() === userName.trim().toLowerCase())) && (
+                      <span className="text-[9px] bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20 px-1.5 py-0.5 rounded-md font-bold" title="Tus propias visitas a esta publicación están excluidas para no inflar las estadísticas">
+                        🛡️ Propias excluidas
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     <button
@@ -4429,14 +4518,28 @@ export default function App() {
       {/* 10. FOOTER STATUS BAR */}
       <footer className="bg-slate-900 text-slate-400 py-6 px-4 mt-12 border-t border-slate-800 text-xs text-center shrink-0">
         <div className="max-w-4xl mx-auto space-y-3">
-          {/* Contador de Visitas destacado y titilante - Sin panel rojo, solo texto destacado que titila */}
-          <div className="flex items-center justify-center space-x-2 text-[11px] sm:text-xs font-black uppercase tracking-wider text-amber-400 animate-pulse select-none pb-1">
+          {/* Contador de Visitas destacado con estado de exclusión */}
+          <div className="flex flex-wrap items-center justify-center gap-2 text-[11px] sm:text-xs font-black uppercase tracking-wider text-amber-400 select-none pb-1">
             <span className="relative flex h-2 w-2">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
               <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
             </span>
-            <span>Contador de visitas:</span>
-            <span className="text-sm font-black text-white px-2 py-0.5 rounded-md bg-slate-800/80 border border-slate-700/60 font-mono">{totalVisits}</span>
+            <span className="text-slate-300">Contador de Visitas Reales:</span>
+            <span className="text-sm font-black text-white px-2.5 py-0.5 rounded-md bg-slate-800/90 border border-amber-500/40 font-mono shadow-xs">
+              {totalVisits.toLocaleString()}
+            </span>
+            <button
+              type="button"
+              onClick={() => handleToggleExcludeSelf(!excludeSelf)}
+              className={`text-[10px] font-bold normal-case px-2 py-0.5 rounded-md border transition-all cursor-pointer flex items-center gap-1 ${
+                excludeSelf
+                  ? "bg-amber-500/10 border-amber-500/40 text-amber-300 hover:bg-amber-500/20"
+                  : "bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200"
+              }`}
+              title="Alternar si tus visitas se excluyen del contador"
+            >
+              <span>{excludeSelf ? "🛡️ Excluyendo mis visitas (ON)" : "⚪ Excluir mis visitas (OFF)"}</span>
+            </button>
           </div>
 
           <p className="font-bold text-slate-200">Ciudad-Trueque © 2026</p>
