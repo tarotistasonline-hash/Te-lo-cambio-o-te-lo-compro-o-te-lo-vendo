@@ -177,6 +177,13 @@ function writeData(data: any) {
 }
 
 // ----------------------
+// GOOGLE SITE VERIFICATION & SEO
+// ----------------------
+app.get("/googleaf622c464da9a177.html", (req, res) => {
+  res.type("text/html").send("google-site-verification: googleaf622c464da9a177.html");
+});
+
+// ----------------------
 // API ROUTES
 // ----------------------
 
